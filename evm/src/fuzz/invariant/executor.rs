@@ -34,6 +34,7 @@ use proptest::{
 use revm::DatabaseCommit;
 use std::{cell::RefCell, collections::BTreeMap, sync::Arc};
 use tracing::warn;
+use std::mem;
 
 /// Alias for (Dictionary for fuzzing, initial contracts to fuzz and an InvariantStrategy).
 type InvariantPreparation =
@@ -80,6 +81,7 @@ impl<'a> InvariantExecutor<'a> {
 
     /// Fuzzes any deployed contract and checks any broken invariant at `invariant_address`
     /// Returns a list of all the consumed gas and calldata of every invariant fuzz case
+    #[allow(mutable_transmutes)]
     pub fn invariant_fuzz(
         &mut self,
         invariant_contract: InvariantContract,
@@ -87,7 +89,7 @@ impl<'a> InvariantExecutor<'a> {
         let (fuzz_state, targeted_contracts, strat) = self.prepare_fuzzing(&invariant_contract)?;
 
         // Stores the consumed gas and calldata of every successful fuzz call.
-        let fuzz_cases: RefCell<Vec<FuzzedCases>> = RefCell::new(Default::default());
+        let mut fuzz_cases: Vec<FuzzedCases> = Default::default();
 
         // Stores data related to reverts or failed assertions of the test.
         let failures =
@@ -97,6 +99,7 @@ impl<'a> InvariantExecutor<'a> {
 
         let last_call_results = RefCell::new(
             assert_invariants(
+                &self.runner,
                 &invariant_contract,
                 &blank_executor.borrow(),
                 &[],
@@ -106,7 +109,7 @@ impl<'a> InvariantExecutor<'a> {
         );
         // Make sure invariants are sound even before starting to fuzz
         if last_call_results.borrow().is_none() {
-            fuzz_cases.borrow_mut().push(FuzzedCases::new(vec![]));
+            fuzz_cases.push(FuzzedCases::new(vec![]));
         }
 
         if failures.borrow().broken_invariants_count < invariant_contract.invariant_functions.len()
@@ -116,6 +119,7 @@ impl<'a> InvariantExecutor<'a> {
             // during the run. We need another proptest runner to query for random
             // values.
             let branch_runner = RefCell::new(self.runner.clone());
+            let new_runner = self.runner.clone();
             let _ = self.runner.run(&strat, |mut inputs| {
                 // Scenarios where we want to fail as soon as possible.
                 {
@@ -181,6 +185,7 @@ impl<'a> InvariantExecutor<'a> {
                     });
 
                     let (can_continue, call_results) = can_continue(
+                        &new_runner.clone(),
                         &invariant_contract,
                         call_result,
                         &executor,
@@ -213,7 +218,8 @@ impl<'a> InvariantExecutor<'a> {
                     }
                 }
 
-                fuzz_cases.borrow_mut().push(FuzzedCases::new(fuzz_runs));
+                let fc: &mut Vec<FuzzedCases> = unsafe { mem::transmute(&fuzz_cases) };
+                fc.push(FuzzedCases::new(fuzz_runs));
 
                 Ok(())
             });
@@ -225,7 +231,7 @@ impl<'a> InvariantExecutor<'a> {
 
         Ok(Some(InvariantFuzzTestResult {
             invariants,
-            cases: fuzz_cases.into_inner(),
+            cases: fuzz_cases,
             reverts,
             last_call_results: last_call_results.take(),
         }))
@@ -551,6 +557,7 @@ fn collect_data(
 /// Verifies that the invariant run execution can continue.
 /// Returns the mapping of (Invariant Function Name -> Call Result) if invariants were asserted.
 fn can_continue(
+    runner: &TestRunner,
     invariant_contract: &InvariantContract,
     call_result: RawCallResult,
     executor: &Executor,
@@ -560,7 +567,7 @@ fn can_continue(
 ) -> (bool, Option<BTreeMap<String, RawCallResult>>) {
     let mut call_results = None;
     if !call_result.reverted {
-        call_results = assert_invariants(invariant_contract, executor, calldata, failures).ok();
+        call_results = assert_invariants(&runner, invariant_contract, executor, calldata, failures).ok();
         if call_results.is_none() {
             return (false, None)
         }

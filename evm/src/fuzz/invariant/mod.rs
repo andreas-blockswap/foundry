@@ -14,7 +14,8 @@ use ethers::{
 };
 pub use executor::{InvariantExecutor, InvariantFailures};
 use parking_lot::Mutex;
-pub use proptest::test_runner::Config as FuzzConfig;
+pub use proptest::test_runner::{Config as FuzzConfig, TestRunner};
+use std::mem;
 use std::{collections::BTreeMap, sync::Arc};
 
 pub type TargetedContracts = BTreeMap<Address, (String, Abi, Vec<Function>)>;
@@ -37,13 +38,15 @@ pub struct InvariantContract<'a> {
 /// Given the executor state, asserts that no invariant has been broken. Otherwise, it fills the
 /// external `invariant_failures.failed_invariant` map and returns a generic error.
 /// Returns the mapping of (Invariant Function Name -> Call Result).
+#[allow(mutable_transmutes)]
 pub fn assert_invariants(
+    runner: &TestRunner,
     invariant_contract: &InvariantContract,
     executor: &Executor,
     calldata: &[BasicTxDetails],
     invariant_failures: &mut InvariantFailures,
 ) -> eyre::Result<BTreeMap<String, RawCallResult>> {
-    let mut found_case = false;
+    let found_case = false;
     let mut inner_sequence = vec![];
 
     if let Some(ref fuzzer) = executor.inspector_config().fuzzer {
@@ -52,58 +55,69 @@ pub fn assert_invariants(
         }
     }
 
-    let mut call_results = BTreeMap::new();
+    let call_results = BTreeMap::new();
     for func in &invariant_contract.invariant_functions {
-        let mut call_result = executor
-            .call_raw(
-                CALLER,
-                invariant_contract.address,
-                func.encode_input(&[]).expect("invariant should have no inputs").into(),
-                U256::zero(),
-            )
-            .expect("EVM error");
+        let strat = proptest::strategy::Union::new_weighted(vec![
+            (100, fuzz_calldata((*func).clone()))
+        ]);
+        let _ = runner.clone().run(&strat, |callargs| {
+            let mut call_result = executor
+                .call_raw(
+                    CALLER,
+                    invariant_contract.address,
+                    callargs.0.clone(),
+                    U256::zero(),
+                )
+                .expect("EVM error");
 
-        let err = if call_result.reverted {
-            Some(*func)
-        } else {
-            // This will panic and get caught by the executor
-            if !executor.is_success(
-                invariant_contract.address,
-                call_result.reverted,
-                call_result.state_changeset.take().expect("we should have a state changeset"),
-                false,
-            ) {
+            let err = if call_result.reverted {
                 Some(*func)
             } else {
-                None
-            }
-        };
+                // This will panic and get caught by the executor
+                if !executor.is_success(
+                    invariant_contract.address,
+                    call_result.reverted,
+                    call_result.state_changeset.take().expect("we should have a state changeset"),
+                    false,
+                ) {
+                    Some(*func)
+                } else {
+                    None
+                }
+            };
 
-        if let Some(broken_invariant) = err {
-            let invariant_error = invariant_failures
-                .failed_invariants
-                .get(&broken_invariant.name)
-                .expect("to have been initialized.");
+            let invariant_failures_transmute: &mut InvariantFailures = unsafe { mem::transmute(&*invariant_failures) };
+            let call_results_transmute: &mut BTreeMap<String, RawCallResult> = unsafe { mem::transmute(&call_results) };
+            let found_case_transmute: &mut bool = unsafe { mem::transmute(&found_case) };
 
-            // We only care about invariants which we haven't broken yet.
-            if invariant_error.is_none() {
-                invariant_failures.failed_invariants.insert(
-                    broken_invariant.name.clone(),
-                    Some(InvariantFuzzError::new(
-                        invariant_contract,
-                        Some(broken_invariant),
-                        calldata,
-                        call_result,
-                        &inner_sequence,
-                    )),
-                );
-                found_case = true;
+            if let Some(broken_invariant) = err {
+                let invariant_error = invariant_failures
+                    .failed_invariants
+                    .get(&broken_invariant.name)
+                    .expect("to have been initialized.");
+
+                // We only care about invariants which we haven't broken yet.
+                if invariant_error.is_none() {
+                    invariant_failures_transmute.failed_invariants.insert(
+                        broken_invariant.name.clone(),
+                        Some(InvariantFuzzError::new(
+                            invariant_contract,
+                            Some(&broken_invariant),
+                            calldata,
+                            call_result,
+                            &inner_sequence,
+                        )),
+                    );
+                    *found_case_transmute = true;
+                } else {
+                    call_results_transmute.insert(func.name.clone(), call_result);
+                }
             } else {
-                call_results.insert(func.name.clone(), call_result);
+                call_results_transmute.insert(func.name.clone(), call_result);
             }
-        } else {
-            call_results.insert(func.name.clone(), call_result);
-        }
+
+            Ok(())
+        });
     }
 
     if found_case {

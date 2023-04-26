@@ -340,9 +340,6 @@ pub fn apply<DB: DatabaseExt>(
             false,
         )?,
         HEVMCalls::StopPrank(_) => {
-            if state.prank.is_none() {
-                return Err("No prank in progress to stop".to_string().encode().into())
-            }
             state.prank = None;
             Bytes::new()
         }
